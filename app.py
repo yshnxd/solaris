@@ -1646,9 +1646,3 @@ def recompute_history_evaluations(history_df, aligned_close_df, save_back=False,
 
     return out_df
 st.subheader("📈 Hourly Auto-Predictions (from GitHub Actions)")
-try:
-    url = "https://raw.githubusercontent.com/<your-username>/<your-repo>/main/predictions_history.csv"
-    df_auto = pd.read_csv(url)
-    st.dataframe(df_auto.tail(20))
-except Exception as e:
-    st.warning(f"No auto predictions available yet: {e}")
