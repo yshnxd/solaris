@@ -1645,4 +1645,4 @@ def recompute_history_evaluations(history_df, aligned_close_df, save_back=False,
             pass
 
     return out_df
-st.subheader("📈 Hourly Auto-Predictions (from GitHub Actions)")
+
