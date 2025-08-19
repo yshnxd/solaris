@@ -1494,14 +1494,16 @@ with tab4:
 with tab5:
     st.subheader("Trading Suggestions")
 
-    # 1. User inputs their available capital
+    # 1. User inputs their available capital and chosen risk %
     capital = st.number_input("Enter your available trading capital (USD):", min_value=0.0, value=10000.0, step=100.0)
+    risk_pct = st.slider("Risk per trade (%)", min_value=1.0, max_value=5.0, value=2.0, step=0.1)
 
-    # 2. Risk per trade: slider strict between 1–2%
-    risk_pct = st.slider("Risk per trade (%)", min_value=1.0, max_value=2.0, value=1.0, step=0.1)
-    risk_amount = capital * (risk_pct / 100)
+    # 2. Default/flexible multipliers
+    st.markdown("#### Advanced Settings")
+    sl_multiplier = st.slider("Stop Loss Multiplier (× ATR(14) 1h)", min_value=0.5, max_value=1.5, value=0.75, step=0.05)
+    tp_multiplier = st.slider("Take Profit Multiplier (× stop loss distance)", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
 
-    # 3. Get latest prediction, price, ATR(14) on 1h
+    # 3. Get latest prediction, price, ATR(14) on 1h candles
     try:
         history = load_history()
         dedup_cols = ['ticker', 'interval', 'target_time']
@@ -1536,20 +1538,7 @@ with tab5:
         atr_14 = None
 
     # 4. Compute trading suggestion
-    # Stop loss distance: slider for 0.5–1.0×ATR(14)
-    st.markdown("#### Volatility-based Stop Loss")
-    stop_loss_multiplier = st.slider("ATR multiplier for stop loss", min_value=0.5, max_value=1.0, value=0.7, step=0.05)
-    if atr_14 is not None and not np.isnan(atr_14) and atr_14 > 0:
-        stop_dist = stop_loss_multiplier * atr_14
-        stop_desc = f"{stop_loss_multiplier} × ATR(14) = {stop_dist:.2f}"
-    else:
-        stop_dist = current_price * 0.005  # fallback 0.5%
-        stop_desc = "Fallback: 0.5% of entry price"
-
-    # Take profit multiple: slider for 1.5–2.0×stop loss
-    tp_multiplier = st.slider("Take profit multiplier", min_value=1.5, max_value=2.0, value=2.0, step=0.1)
-
-    # Direction: BUY/SELL
+    direction = None
     if pred_label in ("up", "buy"):
         direction = "BUY"
     elif pred_label in ("down", "sell"):
@@ -1557,74 +1546,95 @@ with tab5:
     else:
         direction = "HOLD"
 
-    # Entry price: use current live price
     entry = current_price if current_price is not None else entry_price
 
-    # Stop loss/Take profit computation
+    # Stop Loss Distance
+    if atr_14 is not None and not np.isnan(atr_14) and atr_14 > 0:
+        stop_loss_dist = sl_multiplier * atr_14
+        stop_desc = f"{sl_multiplier:.2f} × ATR(14) = {stop_loss_dist:.2f}"
+    else:
+        stop_loss_dist = entry * 0.005  # fallback 0.5%
+        stop_desc = "Fallback: 0.5% of entry price"
+
+    # Stop Loss/Take Profit Calculation
     if direction == "BUY":
-        stop_loss = entry - stop_dist
-        take_profit = entry + (tp_multiplier * stop_dist)
+        stop_loss = entry - stop_loss_dist
+        take_profit = entry + (tp_multiplier * stop_loss_dist)
     elif direction == "SELL":
-        stop_loss = entry + stop_dist
-        take_profit = entry - (tp_multiplier * stop_dist)
+        stop_loss = entry + stop_loss_dist
+        take_profit = entry - (tp_multiplier * stop_loss_dist)
     else:
         stop_loss = None
         take_profit = None
 
-    # Position size: (capital × risk%) ÷ stop loss distance
-    position_size = int(risk_amount / stop_dist) if (stop_dist > 0 and entry is not None and direction in ["BUY", "SELL"]) else 0
+    # Capital at risk ($)
+    cap_at_risk = capital * (risk_pct / 100)
+
+    # Suggested shares (position size)
+    if stop_loss_dist > 0:
+        suggested_shares = int(cap_at_risk // stop_loss_dist)
+    else:
+        suggested_shares = 0
 
     # Reward-to-risk ratio
-    rr_ratio = (abs(take_profit - entry) / abs(stop_loss - entry)) if (take_profit is not None and stop_loss is not None and entry is not None) else None
+    try:
+        rr_ratio = (abs(take_profit - entry) / abs(stop_loss - entry)) if (take_profit is not None and stop_loss is not None and entry is not None and stop_loss != entry) else None
+    except Exception:
+        rr_ratio = None
 
     # Summary
     summary = []
     if direction == "BUY":
-        summary.append("Model predicts upward movement in the next hour.")
+        summary.append("Model predicts upward movement for the next hour.")
     elif direction == "SELL":
-        summary.append("Model predicts downward movement in the next hour.")
+        summary.append("Model predicts downward movement for the next hour.")
     else:
         summary.append("Model predicts neutral movement. No trade recommended.")
     if pred_conf is not None:
         summary.append(f"Prediction confidence: {round(pred_conf*100,1)}%.")
     if atr_14 is not None and not np.isnan(atr_14):
-        summary.append(f"Recent volatility (ATR(14) on 1h candles): {round(atr_14,2)}.")
+        summary.append(f"Recent volatility (ATR(14) 1h): {round(atr_14,2)}.")
     summary.append(f"Stop loss distance: {stop_desc}.")
-    summary.append(f"Take profit multiplier: {tp_multiplier}×.")
-    summary.append("Risk per trade is strictly limited to 1-2% of capital.")
+    summary.append(f"Take profit multiplier: {tp_multiplier:.2f}×.")
+    summary.append(f"Capital at risk: ${cap_at_risk:,.2f} ({risk_pct:.2f}%).")
     summary.append("Estimated holding time: 1 hour.")
 
     # Output card/table
     st.markdown("### Suggested Trade")
     if direction in ["BUY", "SELL"]:
-        st.write(f"#### {direction} {ticker} for 1 hour")
-        st.table({
-            "Direction": direction,
-            "Suggested Shares": position_size,
-            "Entry Price": f"${entry:,.2f}",
-            "Stop Loss Price": f"${stop_loss:,.2f}",
-            "Take Profit Price": f"${take_profit:,.2f}",
-            "Reward-to-Risk Ratio": f"{round(rr_ratio,2) if rr_ratio is not None else 'N/A'} : 1",
-            "Estimated Holding Time": "1 hour"
-        })
-        st.markdown("#### Summary")
-        st.markdown(" ".join(summary))
+        if suggested_shares < 1:
+            st.error("Capital too small to enter this trade under risk rules. Adjust your capital, risk %, or stop loss settings.")
+            st.write(" ".join(summary))
+        else:
+            st.table({
+                "Direction": direction,
+                "Suggested Shares": suggested_shares,
+                "Entry Price": f"${entry:,.2f}" if entry is not None else "N/A",
+                "Stop Loss Price": f"${stop_loss:,.2f}" if stop_loss is not None else "N/A",
+                "Take Profit Price": f"${take_profit:,.2f}" if take_profit is not None else "N/A",
+                "Reward-to-Risk Ratio": f"{round(rr_ratio,2) if rr_ratio is not None else 'N/A'} : 1",
+                "Capital at Risk ($)": f"${cap_at_risk:,.2f}",
+                "Estimated Holding Time": "1 hour"
+            })
+            st.markdown("#### Summary")
+            st.markdown(" ".join(summary))
     else:
         st.info("No trade suggested — model indicates neutral movement or data is insufficient.")
         st.write(" ".join(summary))
 
     # Optional: download suggestion as CSV
-    if direction in ["BUY", "SELL"]:
+    if direction in ["BUY", "SELL"] and suggested_shares >= 1:
         suggestion_dict = {
             "Direction": direction,
-            "Suggested Shares": position_size,
+            "Suggested Shares": suggested_shares,
             "Entry Price": entry,
             "Stop Loss Price": stop_loss,
             "Take Profit Price": take_profit,
             "Reward-to-Risk Ratio": round(rr_ratio,2) if rr_ratio is not None else None,
-            "Prediction Confidence": round(pred_conf*100,1) if pred_conf is not None else None,
+            "Capital at Risk ($)": cap_at_risk,
+            "Risk %": risk_pct,
             "ATR(14)": round(atr_14,2) if atr_14 is not None else None,
-            "Stop Loss Multiplier": stop_loss_multiplier,
+            "Stop Loss Multiplier": sl_multiplier,
             "Take Profit Multiplier": tp_multiplier,
             "Summary": ' '.join(summary),
             "Timestamp": pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
