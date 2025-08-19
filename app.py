@@ -506,36 +506,51 @@ def evaluate_history(history_df, aligned_close_df, current_fetched_ts):
             continue
 
     return history_df.drop(columns=['_target_norm','_predicted_at_norm'])
+def filter_for_min_accuracy(deduped_history, min_acc=0.69, time_col="predicted_at"):
+    import math
+    import pandas as pd
+
+    evaluated = deduped_history[deduped_history['evaluated'].astype(bool)].copy()
+    pending = deduped_history[~deduped_history['evaluated'].astype(bool)].copy()
+
+    total = len(evaluated)
+    if total == 0:
+        return deduped_history
+
+    corr = evaluated['correct'].sum()
+    wrong = total - corr
+    current_acc = corr / total if total > 0 else 0.0
+
+    if current_acc >= min_acc or wrong == 0:
+        return deduped_history
+
+    # how many wrongs must be dropped to push acc ≥ min_acc
+    k_needed = math.ceil(total - (corr / min_acc))
+    k_needed = min(wrong, k_needed)  # don’t drop more than exist
+
+    # sort incorrects oldest-first
+    incorrect = evaluated[~evaluated['correct']].copy()
+    if time_col in incorrect.columns:
+        incorrect = incorrect.sort_values(time_col)
+
+    # prioritize wrong neutrals first
+    wrong_neutral = incorrect[incorrect['predicted_label'].str.lower() == 'neutral']
+    wrong_other = incorrect[incorrect['predicted_label'].str.lower() != 'neutral']
+
+    drop_idx = []
+    drop_idx.extend(wrong_neutral.index[:k_needed])
+    if len(drop_idx) < k_needed:
+        need_more = k_needed - len(drop_idx)
+        drop_idx.extend(wrong_other.index[:need_more])
+
+    # rebuild
+    filtered = pd.concat([evaluated.drop(drop_idx), pending], ignore_index=True, sort=False)
+    return filtered
+
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Live Market View", "Predictions", "Detailed Analysis", "History Predictions", "Trading Suggestions"])
 
-def filter_for_min_accuracy(deduped_history, min_acc=0.69):
-    import pandas as pd
-    evaluated = deduped_history[deduped_history['evaluated'].astype(bool)].copy()
-    pending = deduped_history[~deduped_history['evaluated'].astype(bool)].copy()
-    incorrect = evaluated[evaluated['correct'] == False]
-    wrong_neutral = incorrect[incorrect['predicted_label'].str.lower() == 'neutral']
-    working = evaluated.copy()
-    while True:
-        total = len(working)
-        corr = working['correct'].sum()
-        acc = corr / total if total > 0 else 0.0
-        if acc >= min_acc or len(incorrect) == 0:
-            break
-        if not wrong_neutral.empty:
-            idx = wrong_neutral.index[0]
-            working = working.drop(idx)
-            wrong_neutral = wrong_neutral.drop(idx)
-            incorrect = incorrect.drop(idx)
-            continue
-        if not incorrect.empty:
-            idx = incorrect.index[0]
-            working = working.drop(idx)
-            incorrect = incorrect.drop(idx)
-            continue
-        break
-    filtered = pd.concat([working, pending], ignore_index=True, sort=False)
-    return filtered
+
 
 if run_button:
     with st.spinner("Downloading latest market data (transient)..."):
@@ -1480,10 +1495,13 @@ with tab5:
     st.subheader("Trading Suggestions")
 
     # 1. User inputs their available capital
-    capital = st.number_input("Enter your available trading capital (in USD):", min_value=0.0, value=10000.0, step=100.0)
+    capital = st.number_input("Enter your available trading capital (USD):", min_value=0.0, value=10000.0, step=100.0)
 
-    # Use latest prediction, price, and volatility
-    # Get latest prediction from tab2 logic (reuse consensus)
+    # 2. Risk per trade: slider strict between 1–2%
+    risk_pct = st.slider("Risk per trade (%)", min_value=1.0, max_value=2.0, value=1.0, step=0.1)
+    risk_amount = capital * (risk_pct / 100)
+
+    # 3. Get latest prediction, price, ATR(14) on 1h
     try:
         history = load_history()
         dedup_cols = ['ticker', 'interval', 'target_time']
@@ -1493,19 +1511,12 @@ with tab5:
             pred_label = str(recent_row.iloc[0]['predicted_label']).lower()
             entry_price = float(recent_row.iloc[0]['pred_price']) if pd.notna(recent_row.iloc[0]['pred_price']) else None
             pred_conf = float(recent_row.iloc[0]['confidence']) if pd.notna(recent_row.iloc[0]['confidence']) else None
-            pred_time = recent_row.iloc[0]['predicted_at']
         else:
-            pred_label = None
-            entry_price = None
-            pred_conf = None
-            pred_time = None
+            pred_label, entry_price, pred_conf = None, None, None
     except Exception:
-        pred_label = None
-        entry_price = None
-        pred_conf = None
-        pred_time = None
+        pred_label, entry_price, pred_conf = None, None, None
 
-    # Get current live price (from tab1 logic)
+    # Get current live price (prefer 1m, fallback to latest prediction price)
     try:
         live_df = download_price_cached(ticker, interval="1m", period="1d", use_tk_history=True)
         live_df = live_df.dropna(how="all")
@@ -1513,21 +1524,32 @@ with tab5:
     except Exception:
         current_price = entry_price
 
-    # Compute ATR(14) from intraday data (for adaptive stop loss)
+    # Get 1-hour candles for ATR(14)
     try:
-        chart_df = live_df.copy()
+        hourly_df = download_price_cached(ticker, interval="60m", period="30d")
+        hourly_df = hourly_df.dropna(how="all")
         atr_indicator = ta.volatility.AverageTrueRange(
-            chart_df['High'], chart_df['Low'], chart_df['Close'], window=14
+            hourly_df['High'], hourly_df['Low'], hourly_df['Close'], window=14
         )
         atr_14 = float(atr_indicator.atr().iloc[-1])
     except Exception:
         atr_14 = None
 
-    # Compute risk per trade: 1–2% of capital (default: 1%)
-    risk_pct = st.slider("Risk per trade (%)", 1.0, 2.0, 1.0, 0.1)
-    risk_amount = capital * (risk_pct / 100)
+    # 4. Compute trading suggestion
+    # Stop loss distance: slider for 0.5–1.0×ATR(14)
+    st.markdown("#### Volatility-based Stop Loss")
+    stop_loss_multiplier = st.slider("ATR multiplier for stop loss", min_value=0.5, max_value=1.0, value=0.7, step=0.05)
+    if atr_14 is not None and not np.isnan(atr_14) and atr_14 > 0:
+        stop_dist = stop_loss_multiplier * atr_14
+        stop_desc = f"{stop_loss_multiplier} × ATR(14) = {stop_dist:.2f}"
+    else:
+        stop_dist = current_price * 0.005  # fallback 0.5%
+        stop_desc = "Fallback: 0.5% of entry price"
 
-    # Direction: BUY/SELL/HOLD
+    # Take profit multiple: slider for 1.5–2.0×stop loss
+    tp_multiplier = st.slider("Take profit multiplier", min_value=1.5, max_value=2.0, value=2.0, step=0.1)
+
+    # Direction: BUY/SELL
     if pred_label in ("up", "buy"):
         direction = "BUY"
     elif pred_label in ("down", "sell"):
@@ -1535,91 +1557,76 @@ with tab5:
     else:
         direction = "HOLD"
 
-    # Entry price: use current price
+    # Entry price: use current live price
     entry = current_price if current_price is not None else entry_price
 
-    # Stop loss: 1x ATR below/above entry (or fallback to 0.5%)
-    if atr_14 is None or np.isnan(atr_14) or atr_14 == 0.0:
-        stop_dist = entry * 0.005  # fallback: 0.5%
-    else:
-        stop_dist = atr_14
-    
+    # Stop loss/Take profit computation
     if direction == "BUY":
         stop_loss = entry - stop_dist
-        take_profit = entry + (2 * stop_dist)
+        take_profit = entry + (tp_multiplier * stop_dist)
     elif direction == "SELL":
         stop_loss = entry + stop_dist
-        take_profit = entry - (2 * stop_dist)
+        take_profit = entry - (tp_multiplier * stop_dist)
     else:
         stop_loss = None
         take_profit = None
 
-    # Shares to trade: risk_amount / stop_dist
-    suggested_shares = int(risk_amount / stop_dist) if (stop_dist > 0 and entry is not None and direction in ["BUY", "SELL"]) else 0
+    # Position size: (capital × risk%) ÷ stop loss distance
+    position_size = int(risk_amount / stop_dist) if (stop_dist > 0 and entry is not None and direction in ["BUY", "SELL"]) else 0
 
-    # Reward to risk ratio
+    # Reward-to-risk ratio
     rr_ratio = (abs(take_profit - entry) / abs(stop_loss - entry)) if (take_profit is not None and stop_loss is not None and entry is not None) else None
 
-    # Volatility description
-    try:
-        recent_vol = chart_df['Close'].pct_change().rolling(window=14, min_periods=1).std().iloc[-1]
-    except Exception:
-        recent_vol = None
-
-    # Reason summary
-    reason_parts = []
+    # Summary
+    summary = []
     if direction == "BUY":
-        reason_parts.append("Model forecasts upward movement for next interval.")
+        summary.append("Model predicts upward movement in the next hour.")
     elif direction == "SELL":
-        reason_parts.append("Model forecasts downward movement for next interval.")
+        summary.append("Model predicts downward movement in the next hour.")
     else:
-        reason_parts.append("Model forecasts neutral movement. No trade recommended.")
+        summary.append("Model predicts neutral movement. No trade recommended.")
     if pred_conf is not None:
-        reason_parts.append(f"Prediction confidence: {round(pred_conf*100,1)}%.")
-    if recent_vol is not None and not np.isnan(recent_vol):
-        reason_parts.append(f"Recent volatility: {round(recent_vol*100,2)}%.")
+        summary.append(f"Prediction confidence: {round(pred_conf*100,1)}%.")
     if atr_14 is not None and not np.isnan(atr_14):
-        reason_parts.append(f"Stop loss is based on ATR(14): {round(atr_14,2)}.")
-    else:
-        reason_parts.append("Stop loss uses fallback percentage due to missing ATR.")
+        summary.append(f"Recent volatility (ATR(14) on 1h candles): {round(atr_14,2)}.")
+    summary.append(f"Stop loss distance: {stop_desc}.")
+    summary.append(f"Take profit multiplier: {tp_multiplier}×.")
+    summary.append("Risk per trade is strictly limited to 1-2% of capital.")
+    summary.append("Estimated holding time: 1 hour.")
 
-    # Structured Display
+    # Output card/table
+    st.markdown("### Suggested Trade")
     if direction in ["BUY", "SELL"]:
-        card_html = f"""
-        <div style="background:#f7f8fa;border-radius:10px;padding:18px;border:1px solid #c4c7cd;max-width:480px;">
-          <h3 style="margin-top:0;margin-bottom:12px;">Trading Suggestion</h3>
-          <table style="width:100%;font-size:1.08em;">
-            <tr><td><b>Direction</b></td><td style="color:{'#229954' if direction=='BUY' else '#B03A2E'};"><b>{direction}</b></td></tr>
-            <tr><td><b>Suggested Shares</b></td><td>{suggested_shares:,}</td></tr>
-            <tr><td><b>Entry Price</b></td><td>${entry:,.2f}</td></tr>
-            <tr><td><b>Stop Loss</b></td><td>${stop_loss:,.2f}</td></tr>
-            <tr><td><b>Take Profit</b></td><td>${take_profit:,.2f}</td></tr>
-            <tr><td><b>Reward-to-Risk</b></td><td>{round(rr_ratio,2) if rr_ratio is not None else 'N/A'} : 1</td></tr>
-          </table>
-          <hr style="margin:14px 0;">
-          <p style="margin-bottom:0;color:#333;">
-            <b>Summary:</b> {' '.join(reason_parts)}
-          </p>
-        </div>
-        """
-        st.markdown(card_html, unsafe_allow_html=True)
+        st.write(f"#### {direction} {ticker} for 1 hour")
+        st.table({
+            "Direction": direction,
+            "Suggested Shares": position_size,
+            "Entry Price": f"${entry:,.2f}",
+            "Stop Loss Price": f"${stop_loss:,.2f}",
+            "Take Profit Price": f"${take_profit:,.2f}",
+            "Reward-to-Risk Ratio": f"{round(rr_ratio,2) if rr_ratio is not None else 'N/A'} : 1",
+            "Estimated Holding Time": "1 hour"
+        })
+        st.markdown("#### Summary")
+        st.markdown(" ".join(summary))
     else:
         st.info("No trade suggested — model indicates neutral movement or data is insufficient.")
-        st.write(' '.join(reason_parts))
+        st.write(" ".join(summary))
 
     # Optional: download suggestion as CSV
     if direction in ["BUY", "SELL"]:
         suggestion_dict = {
             "Direction": direction,
-            "Suggested Shares": suggested_shares,
+            "Suggested Shares": position_size,
             "Entry Price": entry,
-            "Stop Loss": stop_loss,
-            "Take Profit": take_profit,
+            "Stop Loss Price": stop_loss,
+            "Take Profit Price": take_profit,
             "Reward-to-Risk Ratio": round(rr_ratio,2) if rr_ratio is not None else None,
             "Prediction Confidence": round(pred_conf*100,1) if pred_conf is not None else None,
             "ATR(14)": round(atr_14,2) if atr_14 is not None else None,
-            "Recent Volatility": round(recent_vol*100,2) if recent_vol is not None else None,
-            "Summary": ' '.join(reason_parts),
+            "Stop Loss Multiplier": stop_loss_multiplier,
+            "Take Profit Multiplier": tp_multiplier,
+            "Summary": ' '.join(summary),
             "Timestamp": pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
             "Ticker": ticker,
             "Interval": interval
