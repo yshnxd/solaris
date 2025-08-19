@@ -507,7 +507,7 @@ def evaluate_history(history_df, aligned_close_df, current_fetched_ts):
 
     return history_df.drop(columns=['_target_norm','_predicted_at_norm'])
 
-tab1, tab2, tab3, tab4 = st.tabs(["Live Market View", "Predictions", "Detailed Analysis", "History Predictions"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Live Market View", "Predictions", "Detailed Analysis", "History Predictions", "Trading Suggestions"])
 
 def filter_for_min_accuracy(deduped_history, min_acc=0.69):
     import pandas as pd
@@ -1476,6 +1476,157 @@ with tab4:
         st.download_button("Download history CSV", data=csv_bytes, file_name="predictions_history_deduped.csv")
     except Exception:
         pass
+with tab5:
+    st.subheader("Trading Suggestions")
+
+    # 1. User inputs their available capital
+    capital = st.number_input("Enter your available trading capital (in USD):", min_value=0.0, value=10000.0, step=100.0)
+
+    # Use latest prediction, price, and volatility
+    # Get latest prediction from tab2 logic (reuse consensus)
+    try:
+        history = load_history()
+        dedup_cols = ['ticker', 'interval', 'target_time']
+        deduped_history = history.sort_values('predicted_at', ascending=False).drop_duplicates(subset=dedup_cols, keep='first')
+        recent_row = deduped_history[deduped_history['ticker'].str.upper() == ticker.upper()].sort_values('predicted_at', ascending=False).head(1)
+        if not recent_row.empty:
+            pred_label = str(recent_row.iloc[0]['predicted_label']).lower()
+            entry_price = float(recent_row.iloc[0]['pred_price']) if pd.notna(recent_row.iloc[0]['pred_price']) else None
+            pred_conf = float(recent_row.iloc[0]['confidence']) if pd.notna(recent_row.iloc[0]['confidence']) else None
+            pred_time = recent_row.iloc[0]['predicted_at']
+        else:
+            pred_label = None
+            entry_price = None
+            pred_conf = None
+            pred_time = None
+    except Exception:
+        pred_label = None
+        entry_price = None
+        pred_conf = None
+        pred_time = None
+
+    # Get current live price (from tab1 logic)
+    try:
+        live_df = download_price_cached(ticker, interval="1m", period="1d", use_tk_history=True)
+        live_df = live_df.dropna(how="all")
+        current_price = float(live_df['Close'].iloc[-1]) if not live_df.empty else entry_price
+    except Exception:
+        current_price = entry_price
+
+    # Compute ATR(14) from intraday data (for adaptive stop loss)
+    try:
+        chart_df = live_df.copy()
+        atr_indicator = ta.volatility.AverageTrueRange(
+            chart_df['High'], chart_df['Low'], chart_df['Close'], window=14
+        )
+        atr_14 = float(atr_indicator.atr().iloc[-1])
+    except Exception:
+        atr_14 = None
+
+    # Compute risk per trade: 1–2% of capital (default: 1%)
+    risk_pct = st.slider("Risk per trade (%)", 1.0, 2.0, 1.0, 0.1)
+    risk_amount = capital * (risk_pct / 100)
+
+    # Direction: BUY/SELL/HOLD
+    if pred_label in ("up", "buy"):
+        direction = "BUY"
+    elif pred_label in ("down", "sell"):
+        direction = "SELL"
+    else:
+        direction = "HOLD"
+
+    # Entry price: use current price
+    entry = current_price if current_price is not None else entry_price
+
+    # Stop loss: 1x ATR below/above entry (or fallback to 0.5%)
+    if atr_14 is None or np.isnan(atr_14) or atr_14 == 0.0:
+        stop_dist = entry * 0.005  # fallback: 0.5%
+    else:
+        stop_dist = atr_14
+    
+    if direction == "BUY":
+        stop_loss = entry - stop_dist
+        take_profit = entry + (2 * stop_dist)
+    elif direction == "SELL":
+        stop_loss = entry + stop_dist
+        take_profit = entry - (2 * stop_dist)
+    else:
+        stop_loss = None
+        take_profit = None
+
+    # Shares to trade: risk_amount / stop_dist
+    suggested_shares = int(risk_amount / stop_dist) if (stop_dist > 0 and entry is not None and direction in ["BUY", "SELL"]) else 0
+
+    # Reward to risk ratio
+    rr_ratio = (abs(take_profit - entry) / abs(stop_loss - entry)) if (take_profit is not None and stop_loss is not None and entry is not None) else None
+
+    # Volatility description
+    try:
+        recent_vol = chart_df['Close'].pct_change().rolling(window=14, min_periods=1).std().iloc[-1]
+    except Exception:
+        recent_vol = None
+
+    # Reason summary
+    reason_parts = []
+    if direction == "BUY":
+        reason_parts.append("Model forecasts upward movement for next interval.")
+    elif direction == "SELL":
+        reason_parts.append("Model forecasts downward movement for next interval.")
+    else:
+        reason_parts.append("Model forecasts neutral movement. No trade recommended.")
+    if pred_conf is not None:
+        reason_parts.append(f"Prediction confidence: {round(pred_conf*100,1)}%.")
+    if recent_vol is not None and not np.isnan(recent_vol):
+        reason_parts.append(f"Recent volatility: {round(recent_vol*100,2)}%.")
+    if atr_14 is not None and not np.isnan(atr_14):
+        reason_parts.append(f"Stop loss is based on ATR(14): {round(atr_14,2)}.")
+    else:
+        reason_parts.append("Stop loss uses fallback percentage due to missing ATR.")
+
+    # Structured Display
+    if direction in ["BUY", "SELL"]:
+        card_html = f"""
+        <div style="background:#f7f8fa;border-radius:10px;padding:18px;border:1px solid #c4c7cd;max-width:480px;">
+          <h3 style="margin-top:0;margin-bottom:12px;">Trading Suggestion</h3>
+          <table style="width:100%;font-size:1.08em;">
+            <tr><td><b>Direction</b></td><td style="color:{'#229954' if direction=='BUY' else '#B03A2E'};"><b>{direction}</b></td></tr>
+            <tr><td><b>Suggested Shares</b></td><td>{suggested_shares:,}</td></tr>
+            <tr><td><b>Entry Price</b></td><td>${entry:,.2f}</td></tr>
+            <tr><td><b>Stop Loss</b></td><td>${stop_loss:,.2f}</td></tr>
+            <tr><td><b>Take Profit</b></td><td>${take_profit:,.2f}</td></tr>
+            <tr><td><b>Reward-to-Risk</b></td><td>{round(rr_ratio,2) if rr_ratio is not None else 'N/A'} : 1</td></tr>
+          </table>
+          <hr style="margin:14px 0;">
+          <p style="margin-bottom:0;color:#333;">
+            <b>Summary:</b> {' '.join(reason_parts)}
+          </p>
+        </div>
+        """
+        st.markdown(card_html, unsafe_allow_html=True)
+    else:
+        st.info("No trade suggested — model indicates neutral movement or data is insufficient.")
+        st.write(' '.join(reason_parts))
+
+    # Optional: download suggestion as CSV
+    if direction in ["BUY", "SELL"]:
+        suggestion_dict = {
+            "Direction": direction,
+            "Suggested Shares": suggested_shares,
+            "Entry Price": entry,
+            "Stop Loss": stop_loss,
+            "Take Profit": take_profit,
+            "Reward-to-Risk Ratio": round(rr_ratio,2) if rr_ratio is not None else None,
+            "Prediction Confidence": round(pred_conf*100,1) if pred_conf is not None else None,
+            "ATR(14)": round(atr_14,2) if atr_14 is not None else None,
+            "Recent Volatility": round(recent_vol*100,2) if recent_vol is not None else None,
+            "Summary": ' '.join(reason_parts),
+            "Timestamp": pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "Ticker": ticker,
+            "Interval": interval
+        }
+        df_sugg = pd.DataFrame([suggestion_dict])
+        st.download_button("Download Trading Suggestion CSV", data=df_sugg.to_csv(index=False).encode("utf-8"), file_name="trading_suggestion.csv")
+
 # -----------------------------------------------------------------------------
 # Utility: recompute_history_evaluations
 # -----------------------------------------------------------------------------
