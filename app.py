@@ -529,7 +529,7 @@ def filter_for_min_accuracy(deduped_history, min_acc=0.69, time_col="predicted_a
     k_needed = min(wrong, k_needed)  # don’t drop more than exist
 
     # sort incorrects oldest-first
-    incorrect = evaluated[~evaluated['correct']].copy()
+    incorrect = evaluated[evaluated['correct']].copy()
     if time_col in incorrect.columns:
         incorrect = incorrect.sort_values(time_col)
 
