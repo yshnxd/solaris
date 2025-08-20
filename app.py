@@ -520,7 +520,7 @@ def filter_for_min_accuracy(deduped_history, min_acc=0.69, time_col="predicted_a
     if total == 0:
         return deduped_history
 
-    corr = evaluated['correct'].sum()
+    correct = evaluated['correct'].sum()
     wrong = total - corr
     current_acc = corr / total if total > 0 else 0.0
 
