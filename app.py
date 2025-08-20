@@ -528,7 +528,7 @@ def filter_for_min_accuracy(deduped_history, min_acc=0.69, time_col="predicted_a
         return deduped_history
 
     # how many wrongs must be dropped to push acc ≥ min_acc
-    k_needed = math.ceil(total - (corr / min_acc))
+    k_needed = math.ceil(total - (correct / min_acc))
     k_needed = min(wrong, k_needed)  # don’t drop more than exist
 
     # sort incorrects oldest-first
