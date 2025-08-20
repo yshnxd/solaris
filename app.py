@@ -510,8 +510,11 @@ def filter_for_min_accuracy(deduped_history, min_acc=0.69, time_col="predicted_a
     import math
     import pandas as pd
 
+    if 'evaluated' not in deduped_history.columns:
+        deduped_history['evaluated'] = False
+        
     evaluated = deduped_history[deduped_history['evaluated'].astype(bool)].copy()
-    pending = deduped_history[deduped_history['evaluated'].astype(bool)].copy()
+    pending = deduped_history[~deduped_history['evaluated'].astype(bool)].copy()
 
     total = len(evaluated)
     if total == 0:
