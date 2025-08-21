@@ -1,4 +1,4 @@
-# app.py - SOLARIS — Stock Price Movement Predictor (REVISED: fixes logging predictions when run, prediction now always logged)
+# app.py - SOLARIS — Stock Price Movement Predictor (Persistent History FIXED: uses session_state, history never resets, deduped appends)
 import os
 import tempfile
 import warnings
@@ -26,6 +26,66 @@ SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
 tf.random.set_seed(SEED)
+
+# ---------------------------------------
+# --- Persistent History (session_state) 
+# ---------------------------------------
+def get_history_file():
+    # Allow user to change history file in sidebar if desired
+    return st.session_state.get('history_file', st.sidebar.text_input("History CSV file", "predictions_history.csv"))
+
+history_file = get_history_file()
+
+def load_history():
+    if "history" not in st.session_state:
+        if os.path.exists(history_file):
+            df = pd.read_csv(history_file)
+            for c in ["predicted_at","fetched_last_ts","target_time","checked_at"]:
+                if c in df.columns:
+                    df[c] = pd.to_datetime(df[c], errors='coerce')
+            st.session_state["history"] = df
+        else:
+            st.session_state["history"] = pd.DataFrame()
+    return st.session_state["history"]
+
+def save_history(df):
+    df.to_csv(history_file, index=False)
+    st.session_state["history"] = df
+
+def append_prediction_with_dedup(history, new_row):
+    import pandas as pd
+    if history is None or (hasattr(history,'empty') and history.empty):
+        out = pd.DataFrame([new_row])
+    else:
+        if 'ticker' not in history.columns:
+            history['ticker'] = pd.NA
+        if 'interval' not in history.columns:
+            history['interval'] = pd.NA
+        if 'target_time' not in history.columns:
+            history['target_time'] = pd.NA
+        def _norm_ts(x):
+            try:
+                return str(ensure_timestamp_in_manila(x))
+            except Exception:
+                return str(pd.to_datetime(x, errors='coerce'))
+        new_tgt_norm = _norm_ts(new_row.get('target_time'))
+        hist_ticker = history['ticker'].astype(str).str.upper()
+        hist_interval = history['interval'].astype(str)
+        hist_target_norm = history['target_time'].apply(lambda x: _norm_ts(x) if pd.notna(x) else "")
+        new_key = (str(new_row.get('ticker','')).upper(), str(new_row.get('interval','')), str(new_tgt_norm))
+        mask_same = (hist_ticker == new_key[0]) & (hist_interval == new_key[1]) & (hist_target_norm == new_key[2])
+        if mask_same.any():
+            history = history.loc[~mask_same].reset_index(drop=True)
+        missing_cols = set(new_row.keys()) - set(history.columns)
+        for mc in missing_cols:
+            history[mc] = pd.NA
+        out = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True, sort=False)
+        # Deduplicate: keep latest prediction per (ticker, interval, target_time)
+        dedup_cols = ['ticker','interval','target_time']
+        out = out.sort_values('predicted_at', ascending=False).drop_duplicates(subset=dedup_cols, keep='first')
+    return out
+
+# ---------------------------------------
 
 st.set_page_config(page_title="Solaris - Predict Next Hour!", layout="wide")
 st.title("SOLARIS — Stock Price Movement Predictor")
@@ -56,7 +116,6 @@ label_map = [s.strip().lower() for s in label_map_input.split(",")]
 prob_threshold = st.sidebar.slider("Prob threshold for confident class", 0.05, 0.95, 0.5, 0.05)
 models_to_run = st.sidebar.multiselect("Models to run", ["cnn", "lstm", "xgb", "meta"], default=["cnn", "lstm", "xgb", "meta"])
 run_button = st.sidebar.button("Fetch live data & predict NEXT interval (real-time)")
-history_file = st.sidebar.text_input("History CSV file", "predictions_history.csv")
 
 COLOR_BUY_BG = "#d7e9da"   # soft green
 COLOR_SELL_BG = "#f0e5e6"  # soft rose
@@ -315,21 +374,6 @@ def label_from_model(mod, X_for_proba=None):
     except Exception:
         return (str(pred), 0.0, pred.tolist() if hasattr(pred, "tolist") else str(pred))
 
-def load_history():
-    try:
-        if os.path.exists(history_file):
-            df = pd.read_csv(history_file)
-            for c in ["predicted_at","fetched_last_ts","target_time","checked_at"]:
-                if c in df.columns:
-                    df[c] = pd.to_datetime(df[c], errors='coerce')
-            return df
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def save_history(df):
-    save_history_atomic(df, history_file)
-
 def price_at_or_before(series: pd.Series, when_ts: pd.Timestamp):
     if series is None or series.empty:
         return float("nan")
@@ -354,52 +398,6 @@ def price_at_or_before(series: pd.Series, when_ts: pd.Timestamp):
         first_valid = s.dropna()
         return float(first_valid.iloc[0]) if not first_valid.empty else float("nan")
     return float("nan")
-
-def append_prediction_with_dedup(history, new_row, history_file=None, save_history_func=None):
-    import pandas as pd
-
-    if history is None or (hasattr(history, 'empty') and history.empty):
-        out = pd.DataFrame([new_row])
-    else:
-        if 'ticker' not in history.columns:
-            history['ticker'] = pd.NA
-        if 'interval' not in history.columns:
-            history['interval'] = pd.NA
-        if 'target_time' not in history.columns:
-            history['target_time'] = pd.NA
-
-        def _norm_ts(x):
-            try:
-                return str(ensure_timestamp_in_manila(x))
-            except Exception:
-                return str(pd.to_datetime(x, errors='coerce'))
-
-        new_tgt_norm = _norm_ts(new_row.get('target_time'))
-        hist_ticker = history['ticker'].astype(str).str.upper()
-        hist_interval = history['interval'].astype(str)
-        hist_target_norm = history['target_time'].apply(lambda x: _norm_ts(x) if pd.notna(x) else "")
-
-        new_key = (str(new_row.get('ticker','')).upper(), str(new_row.get('interval','')), str(new_tgt_norm))
-        mask_same = (hist_ticker == new_key[0]) & (hist_interval == new_key[1]) & (hist_target_norm == new_key[2])
-
-        if mask_same.any():
-            history = history.loc[~mask_same].reset_index(drop=True)
-
-        missing_cols = set(new_row.keys()) - set(history.columns)
-        for mc in missing_cols:
-            history[mc] = pd.NA
-
-        out = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True, sort=False)
-
-    try:
-        if save_history_func is not None:
-            save_history_func(out)
-        elif history_file is not None:
-            out.to_csv(history_file, index=False)
-    except Exception:
-        pass
-
-    return out
 
 def evaluate_history(history_df, aligned_close_df, current_fetched_ts):
     import pandas as pd
@@ -550,10 +548,7 @@ def filter_for_min_accuracy(deduped_history, min_acc=0.69, time_col="predicted_a
     filtered = pd.concat([evaluated.drop(drop_idx), pending], ignore_index=True, sort=False)
     return filtered
 
-
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Live Market View", "Predictions", "Detailed Analysis", "History Predictions", "Trading Suggestions"])
-
-
 
 if run_button:
     with st.spinner("Downloading latest market data (transient)..."):
@@ -595,12 +590,10 @@ if run_button:
     tolerance = interval_seconds * 1.5
     data_is_stale = age_secs > tolerance
 
-    try:
-        history = load_history()
-        history = evaluate_history(history, aligned_close, fetched_last_ts_manila)
-        save_history(history)
-    except Exception as e:
-        warn(f"History evaluation failed: {e}")
+    # --- Persistent history: always load from session_state
+    history = load_history()
+    history = evaluate_history(history, aligned_close, fetched_last_ts_manila)
+    save_history(history)
 
     def build_features(aligned_close_df, raw_dict, tgt):
         aligned_ffill = aligned_close_df.ffill()
@@ -642,24 +635,19 @@ if run_button:
         st.error("Not enough history to compute features for this ticker; increase period.")
         st.stop()
 
-    # --------- FIX: LOG PREDICTION HISTORY HERE ---------
-    history = load_history()  # Reload, not in try/except so it's always a DataFrame
-
-    # Prepare to log the prediction before showing results
+    # --------- Prepare prediction row ---------
     prediction_row = {
         "ticker": ticker,
         "interval": interval,
         "predicted_at": pd.Timestamp.now(ZoneInfo("Asia/Manila")),
         "fetched_last_ts": ensure_timestamp_in_manila(fetched_last_ts),
         "target_time": real_next_time,
-        # The following filled below after making predictions:
         "predicted_label": None,
         "suggestion": None,
         "confidence": None,
         "pred_price": None
     }
 
-    # ------------- TABS ---------------------
     with tab1:
         st.subheader(f"Live Market View — {ticker}")
         st.write(f"Fetched latest timestamp (converted to Manila): **{fetched_last_ts_manila}**")
@@ -918,8 +906,9 @@ if run_button:
                                     lab_idx = int(rawinfo)
                                     if 0 <= lab_idx < len(label_map):
                                         lab_canon = label_map[lab_idx].lower()
-                            except Exception:
-                                pass
+                                except Exception:
+                                    pass
+                        
                         lab_display = lab_canon.capitalize() if lab_canon in ("up","down","neutral") else lab_str.capitalize()
                         results.append({
                             "model": name,
